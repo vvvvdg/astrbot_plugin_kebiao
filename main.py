@@ -1,4 +1,4 @@
-﻿"""课表导入插件（MVP）
+"""课表导入插件（MVP）
 
 功能：
 1. 把教务系统导出的 `学生个人课表_*.xls/.xlsx` 发给机器人 → 解析并按星期排好回复；
@@ -676,10 +676,11 @@ HELP_TEXT = """📖 课表插件 · 命令总览
 
 【查课表】
    /周课表         这周的课（出图）
+   /今日课表       今天上什么（出图，高亮今天那列）
    /明日课表       明天上什么（出图，高亮明天那列）
    /课表 全部      整学期（出图，或 /课表 完整）
-   /今日课表       今天上什么（文字）
    /下一节课       现实世界里下一节课
+   （今日课表 / 明日课表 写成「今天课表 / 明天课表」也一样用）
 
 【同学】
    /谁在上课       看看现在谁在上课
@@ -1034,7 +1035,7 @@ class KebiaoPlugin(Star):
             title=term,
             subtitle=subtitle,
             show_weeks=(week is None),
-            footer="课表插件 · /周课表 看本周 · /明日课表 看明天",
+            footer="课表插件 · /今日课表 · /明日课表 · /周课表",
             highlight=highlight,
             day_dates=day_dates,
         )
@@ -1060,10 +1061,9 @@ class KebiaoPlugin(Star):
             return
         yield event.image_result(self._render_image(event, key, data, week))
 
-    # ---------- 明日课表（图，高亮明天那一列） ----------
-    @filter.command("明日课表")
-    async def tomorrow_cmd(self, event: AstrMessageEvent):
-        """明天的课表（出图）"""
+    # ---------- 今日 / 明日课表（出图，高亮那一天） ----------
+    async def _day_image(self, event: AstrMessageEvent, offset: int):
+        """offset=0 今天，1 明天：出整周的图并高亮那一天"""
         self._count(event, "query")
         key = self._key(event)
         data = self._load(key) or self._load(event.unified_msg_origin)
@@ -1072,20 +1072,21 @@ class KebiaoPlugin(Star):
             return
         self._touch(event, key, data)
         term = data.get("term_start") or DEFAULT_TERM_START
-        tomorrow = _today() + timedelta(days=1)
-        week = _week_of(term, tomorrow)
+        target = _today() + timedelta(days=offset)
+        week = _week_of(term, target)
         if not week or week < 1:
             yield event.plain_result("还没开学喵 (・ω・) 用 /课表 开学 2026-09-07 设一下第一周")
             return
-        day_key = _weekday_key(tomorrow)
-        cn = "一二三四五六日"[tomorrow.weekday()]
+        day_key = _weekday_key(target)
+        cn = "一二三四五六日"[target.weekday()]
+        label = "今天" if offset == 0 else "明天"
         courses = [
             c
             for c in data.get("courses", [])
             if week in c.get("weeks", []) and c.get("day") == day_key
         ]
         if not courses:
-            yield event.plain_result(f"明天（{tomorrow:%m-%d} 周{cn}）没课喵，睡到自然醒 (๑>ᴗ<๑)")
+            yield event.plain_result(f"{label}（{target:%m-%d} 周{cn}）没课喵 (๑>ᴗ<๑)")
             return
         dates: dict[str, str] = {}
         rng = _week_range(term, week)
@@ -1093,12 +1094,36 @@ class KebiaoPlugin(Star):
             monday = rng[0]
             dates = {WEEKDAY_KEYS[i]: f"{(monday + timedelta(days=i)):%m-%d}" for i in range(7)}
         who = self._nick(event)
-        sub = f"{who} · 明天 {tomorrow:%m-%d} 周{cn} · 第 {week} 周"
+        sub = f"{who} · {label} {target:%m-%d} 周{cn} · 第 {week} 周"
         yield event.image_result(
             self._render_image(
                 event, key, data, week, highlight=day_key, day_dates=dates, subtitle=sub
             )
         )
+
+    @filter.command("今日课表")
+    async def today_cmd(self, event: AstrMessageEvent):
+        """今天的课表（出图，高亮今天那一列）"""
+        async for r in self._day_image(event, 0):
+            yield r
+
+    @filter.command("明日课表")
+    async def tomorrow_cmd(self, event: AstrMessageEvent):
+        """明天的课表（出图，高亮明天那一列）"""
+        async for r in self._day_image(event, 1):
+            yield r
+
+    @filter.command("明天课表")
+    async def tomorrow_cmd_alias(self, event: AstrMessageEvent):
+        """「明天课表」/ 明日课表 同一个效果"""
+        async for r in self._day_image(event, 1):
+            yield r
+
+    @filter.command("今天课表")
+    async def today_cmd_alias(self, event: AstrMessageEvent):
+        """「今天课表」/ 今日课表 同一个效果"""
+        async for r in self._day_image(event, 0):
+            yield r
 
     # ---------- 免 / 触发（照抄抽老婆插件的思路） ----------
     def _bare_action(self, text: str):
@@ -1150,22 +1175,7 @@ class KebiaoPlugin(Star):
             yield result
         event.stop_event()
 
-    # ---------- 今日 / 下一节 ----------
-    @filter.command("今日课表")
-    async def today_cmd(self, event: AstrMessageEvent):
-        """今天的课表"""
-        self._count(event, "query")
-        key = self._key(event)
-        data = self._load(key) or self._load(event.unified_msg_origin)
-        if not data:
-            yield event.plain_result(IMPORT_GUIDE)
-            return
-        self._touch(event, key, data)
-        today = _today()
-        term = data.get("term_start") or DEFAULT_TERM_START
-        week = _week_of(term, today)
-        yield event.plain_result(render_schedule(data, week, _weekday_key(today), term, self._nick(event)))
-
+    # ---------- 下一节 ----------
     @filter.command("下一节课")
     async def next_cmd(self, event: AstrMessageEvent):
         """现实世界里下一节课"""
