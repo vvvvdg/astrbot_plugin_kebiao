@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+data/
+preview*.png
+_selftest*.py
+_render_test.py
+_reminder_test.py
+.DS_Store
