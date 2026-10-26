@@ -1,4 +1,4 @@
-﻿"""把课表画成一张图（Pillow），不依赖系统字体：容器里用 Noto Sans CJK。"""
+"""把课表画成一张图（Pillow），不依赖系统字体：容器里用 Noto Sans CJK。"""
 
 from __future__ import annotations
 
@@ -277,11 +277,17 @@ def render_grid(
     subtitle: str = "",
     show_weeks: bool = False,
     footer: str = "",
+    highlight: str | None = None,
+    day_dates: dict[str, str] | None = None,
 ) -> str:
-    """courses: [{day, period, name, location, weeks?, label?}]"""
+    """courses: [{day, period, name, location, weeks?, label?}]
+
+    highlight:  要突出显示的那一天（"星期二" 这种 key），表头蓝底 + 两边亮边
+    day_dates:  {"星期一": "10-27", ...}，给了就在表头每天下面写日期
+    """
     col_w, row_h = 196, 150
     left_w, top_h = 122, 128
-    head_h = 44
+    head_h = 54 if day_dates else 44
     grid_top = top_h + head_h
     width = left_w + col_w * 7
     height = grid_top + row_h * len(BLOCKS) + 40
@@ -300,11 +306,21 @@ def render_grid(
         draw.text((left_w // 2, 78), subtitle, font=f_sub, fill=(110, 116, 128))
 
     # 表头
-    for i, day in enumerate(WEEKDAYS):
+    f_head = _font(26, True)
+    f_date = _font(14)
+    for i, (label, day_key) in enumerate(zip(WEEKDAYS, WEEKDAY_KEYS)):
         x = left_w + i * col_w
-        draw.rectangle([x, top_h, x + col_w, grid_top], fill=(238, 242, 248))
-        tw = draw.textlength(day, font=f_head)
-        draw.text((x + (col_w - tw) / 2, top_h + 9), day, font=f_head, fill=(40, 46, 58))
+        hot = day_key == highlight
+        draw.rectangle([x, top_h, x + col_w, grid_top], fill=(64, 106, 214) if hot else (238, 242, 248))
+        ink = (255, 255, 255) if hot else (40, 46, 58)
+        date_txt = (day_dates or {}).get(day_key, "")
+        tw = draw.textlength(label, font=f_head)
+        if date_txt:
+            draw.text((x + (col_w - tw) / 2, top_h + 4), label, font=f_head, fill=ink)
+            dw = draw.textlength(date_txt, font=f_date)
+            draw.text((x + (col_w - dw) / 2, top_h + 34), date_txt, font=f_date, fill=ink)
+        else:
+            draw.text((x + (col_w - tw) / 2, top_h + 9), label, font=f_head, fill=ink)
 
     # 行底色 + 左侧节次
     for r, base in enumerate(BLOCKS):
@@ -322,6 +338,14 @@ def render_grid(
         x = left_w + c * col_w
         draw.line([(x, top_h), (x, grid_top + len(BLOCKS) * row_h)], fill=(222, 227, 235), width=1)
     draw.line([(0, top_h), (width, top_h)], fill=(222, 227, 235), width=1)
+
+    # 高亮那一列的两条竖边
+    if highlight and highlight in WEEKDAY_KEYS:
+        hi = WEEKDAY_KEYS.index(highlight)
+        hx = left_w + hi * col_w
+        bottom = grid_top + len(BLOCKS) * row_h
+        draw.rectangle([hx, top_h, hx + 3, bottom], fill=(64, 106, 214))
+        draw.rectangle([hx + col_w - 3, top_h, hx + col_w, bottom], fill=(64, 106, 214))
 
     # 同一格里的多门课 → 分道并排
     groups: dict[tuple[int, int, int], list[dict[str, Any]]] = {}

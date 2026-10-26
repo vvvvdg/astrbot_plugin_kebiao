@@ -2,7 +2,7 @@ name: astrbot_plugin_kebiao # 插件唯一识别名
 display_name: kebiao
 desc: 课表导入与排课（把教务导出的 xls 发给我，自动解析并排好）
 help: /课表 查看课表；/课表 8 只看第 8 周；/课表 帮助 看用法；把 学生个人课表_*.xls 发给机器人即可导入
-version: 0.3.0
+version: 0.3.1
 author: sanyi
 repo: "https://github.com/vvvvdg/astrbot_plugin_kebiao"
 astrbot_version: ">=4.11.0"

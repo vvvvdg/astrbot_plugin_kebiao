@@ -1,4 +1,4 @@
-"""课表导入插件（MVP）
+﻿"""课表导入插件（MVP）
 
 功能：
 1. 把教务系统导出的 `学生个人课表_*.xls/.xlsx` 发给机器人 → 解析并按星期排好回复；
@@ -676,6 +676,7 @@ HELP_TEXT = """📖 课表插件 · 命令总览
 
 【查课表】
    /周课表         这周的课（出图）
+   /明日课表       明天上什么（出图，高亮明天那列）
    /课表 全部      整学期（出图，或 /课表 完整）
    /今日课表       今天上什么（文字）
    /下一节课       现实世界里下一节课
@@ -712,7 +713,7 @@ HELP_TEXT = """📖 课表插件 · 命令总览
    /课表 开学 2026-09-07   设置第 1 周的周一
    /课表 删除              清掉已存课表
 
-（这些词不加 / 直接打也能用：周课表、今日课表、下一节课、谁在上课、抓群友、排行榜、上课提醒、课表 全部）"""
+（这些词不加 / 直接打也能用：周课表、明日课表、今日课表、下一节课、谁在上课、抓群友、排行榜、上课提醒、课表 全部）"""
 
 
 IMPORT_GUIDE = """📖 还没有你的课表喵～ 三步就能导入 (๑>ᴗ<๑)
@@ -994,7 +995,16 @@ class KebiaoPlugin(Star):
         # 其他参数一律回到帮助，避免半懂不懂的用法
         yield event.plain_result(HELP_TEXT)
 
-    def _render_image(self, event: AstrMessageEvent, key: str, data: dict[str, Any], week: int | None) -> str:
+    def _render_image(
+        self,
+        event: AstrMessageEvent,
+        key: str,
+        data: dict[str, Any],
+        week: int | None,
+        highlight: str | None = None,
+        day_dates: dict[str, str] | None = None,
+        subtitle: str | None = None,
+    ) -> str:
         """把课表画成图：week=None 画整学期，否则只画那一周"""
         term_start = data.get("term_start") or DEFAULT_TERM_START
         courses: list[dict[str, Any]] = []
@@ -1006,13 +1016,17 @@ class KebiaoPlugin(Star):
             courses.append(item)
         term = data.get("term") or "本学期"
         who = self._nick(event)
-        if week is None:
-            subtitle = f"{who} · 整学期"
-        else:
-            rng = _week_range(term_start, week)
-            span = f"（{rng[0]:%m-%d} ~ {rng[1]:%m-%d}）" if rng else ""
-            subtitle = f"{who} · 第 {week} 周{span}"
-        safe = re.sub(r"[^\w\-]", "_", f"{key}_{week if week is not None else 'all'}")[:60]
+        if subtitle is None:
+            if week is None:
+                subtitle = f"{who} · 整学期"
+            else:
+                rng = _week_range(term_start, week)
+                span = f"（{rng[0]:%m-%d} ~ {rng[1]:%m-%d}）" if rng else ""
+                subtitle = f"{who} · 第 {week} 周{span}"
+        suffix = f"{week if week is not None else 'all'}"
+        if highlight:
+            suffix += f"_{WEEKDAY_KEYS.index(highlight) + 1}"
+        safe = re.sub(r"[^\w\-]", "_", f"{key}_{suffix}")[:60]
         out = os.path.join(DATA_DIR, "img", f"{safe}.png")
         return render_grid(
             courses,
@@ -1020,7 +1034,9 @@ class KebiaoPlugin(Star):
             title=term,
             subtitle=subtitle,
             show_weeks=(week is None),
-            footer="课表插件 · /周课表 看本周 · /今日课表 看今天",
+            footer="课表插件 · /周课表 看本周 · /明日课表 看明天",
+            highlight=highlight,
+            day_dates=day_dates,
         )
 
     # ---------- 周课表（图） ----------
@@ -1044,11 +1060,53 @@ class KebiaoPlugin(Star):
             return
         yield event.image_result(self._render_image(event, key, data, week))
 
+    # ---------- 明日课表（图，高亮明天那一列） ----------
+    @filter.command("明日课表")
+    async def tomorrow_cmd(self, event: AstrMessageEvent):
+        """明天的课表（出图）"""
+        self._count(event, "query")
+        key = self._key(event)
+        data = self._load(key) or self._load(event.unified_msg_origin)
+        if not data:
+            yield event.plain_result(IMPORT_GUIDE)
+            return
+        self._touch(event, key, data)
+        term = data.get("term_start") or DEFAULT_TERM_START
+        tomorrow = _today() + timedelta(days=1)
+        week = _week_of(term, tomorrow)
+        if not week or week < 1:
+            yield event.plain_result("还没开学喵 (・ω・) 用 /课表 开学 2026-09-07 设一下第一周")
+            return
+        day_key = _weekday_key(tomorrow)
+        cn = "一二三四五六日"[tomorrow.weekday()]
+        courses = [
+            c
+            for c in data.get("courses", [])
+            if week in c.get("weeks", []) and c.get("day") == day_key
+        ]
+        if not courses:
+            yield event.plain_result(f"明天（{tomorrow:%m-%d} 周{cn}）没课喵，睡到自然醒 (๑>ᴗ<๑)")
+            return
+        dates: dict[str, str] = {}
+        rng = _week_range(term, week)
+        if rng:
+            monday = rng[0]
+            dates = {WEEKDAY_KEYS[i]: f"{(monday + timedelta(days=i)):%m-%d}" for i in range(7)}
+        who = self._nick(event)
+        sub = f"{who} · 明天 {tomorrow:%m-%d} 周{cn} · 第 {week} 周"
+        yield event.image_result(
+            self._render_image(
+                event, key, data, week, highlight=day_key, day_dates=dates, subtitle=sub
+            )
+        )
+
     # ---------- 免 / 触发（照抄抽老婆插件的思路） ----------
     def _bare_action(self, text: str):
         """裸词 → 对应命令处理函数；不认识的返回 None"""
         if text in ("周课表", "本周课表", "这周课表"):
             return self.week_cmd
+        if text in ("明日课表", "明天课表", "明天上什么", "明天有什么课"):
+            return self.tomorrow_cmd
         if text in ("今日课表", "今天课表", "今天上什么"):
             return self.today_cmd
         if text in ("下一节课", "下一节", "下节课"):
