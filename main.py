@@ -1,4 +1,4 @@
-﻿"""课表导入插件（MVP）
+"""课表导入插件（MVP）
 
 功能：
 1. 把教务系统导出的 `学生个人课表_*.xls/.xlsx` 发给机器人 → 解析并按星期排好回复；
@@ -63,7 +63,10 @@ STATS_FILE = os.path.join(DATA_DIR, "_stats.json")
 # 排行榜上次推给哪个日期，防重复发
 LB_STATE = os.path.join(DATA_DIR, "_rank_last.json")
 # 数据目录里这些是插件自己的状态文件，不当成人来统计
-INTERNAL_FILES = {"cmd_config.json", "_stats.json", "_who_push.json", "_admins.json", "_rank_last.json"}
+INTERNAL_FILES = {"cmd_config.json", "_stats.json", "_who_push.json", "_admins.json", "_rank_last.json", "_titles.json"}
+# 上课时改群头衔：状态文件（开关 + 已经改过的人）
+TITLE_FILE = os.path.join(DATA_DIR, "_titles.json")
+TITLE_TEXT = "上课中"
 # 第 1 周的周一（可在群里用 /课表 开学 2026-09-07 改）
 DEFAULT_TERM_START = "2026-09-07"
 
@@ -694,6 +697,12 @@ HELP_TEXT = """📖 课表插件 · 命令总览
    /播报开         每节课一开始就在群里发「谁在上课」
    /播报关         关掉这个播报
 
+【上课头衔】🔒 管理员
+   /头衔开         上课时把群头衔改成「上课中」，下课还原
+   /头衔关         关掉，并把改过的还原
+   /头衔测试       拿自己试一次（3 秒后还原）
+   /头衔状态       看开关状态
+
 【管理员】🔒
    /管理员          看这个插件认哪些人当管理员
    /管理员 添加 @某人
@@ -723,6 +732,62 @@ https://kdjw.hnust.edu.cn/jsxsd/sso.jsp?jumpUrl=/xskb/xskb_list.do
 · 无所谓 → 群里直接发也行
 
 导入完发 /课表 就能看啦～"""
+
+
+def _group_id_of(umo: str) -> int:
+    """从 umo 里抠群号：平台:GroupMessage:群号"""
+    try:
+        return int(str(umo).rsplit(":", 1)[-1])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def in_class_users(now: datetime) -> list[dict[str, str]]:
+    """这一刻正在上课的人（只要群里的、没隐身的、有 QQ 号的）"""
+    out: list[dict[str, str]] = []
+    for fname in os.listdir(DATA_DIR):
+        if not fname.endswith(".json") or fname in INTERNAL_FILES:
+            continue
+        try:
+            with open(os.path.join(DATA_DIR, fname), encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            continue
+        if not data.get("courses"):
+            continue
+        if not data.get("visible", True):
+            continue
+        umo = str(data.get("umo") or "")
+        qq = str(data.get("qq") or "")
+        if not qq or "GroupMessage" not in umo:
+            continue
+        if not current_lesson(data, now):
+            continue
+        out.append({"umo": umo, "qq": qq, "nick": str(data.get("nickname") or "同学")})
+    return out
+
+
+def title_state_load() -> dict:
+    try:
+        with open(TITLE_FILE, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return {"enabled": False, "groups": {}}
+        if not isinstance(d.get("groups"), dict):
+            d["groups"] = {}
+        d["enabled"] = bool(d.get("enabled", False))
+        return d
+    except Exception:  # noqa: BLE001
+        return {"enabled": False, "groups": {}}
+
+
+def title_state_save(d: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(TITLE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        logger.exception("[kebiao] 头衔状态写入失败")
 
 
 @register("astrbot_plugin_kebiao", "sanyi", "课表导入与排课（MVP）", "0.1.0")
@@ -1113,6 +1178,225 @@ class KebiaoPlugin(Star):
         self._save(key, data)
         yield event.plain_result("⏸️ 提醒已关闭，想开回来发 /上课提醒开 就行喵")
 
+    # ---------- 上课时改群头衔 ----------
+    def _client_for(self, platform_name: str):
+        """按平台名（umo 第一段）拿到 aiocqhttp 的 bot，用来调群管理接口"""
+        try:
+            insts = list(self.context.platform_manager.platform_insts)
+            for plat in insts:
+                try:
+                    meta = plat.meta()
+                    # id 是实例名（香芹），name 是适配器类型（aiocqhttp），两个都认
+                    if platform_name in (meta.id, meta.name) and hasattr(plat, "get_client"):
+                        return plat.get_client()
+                except Exception:  # noqa: BLE001
+                    continue
+            names = []
+            for plat in insts:
+                try:
+                    names.append(f"{plat.meta().name}{'(no get_client)' if not hasattr(plat, 'get_client') else ''}")
+                except Exception:  # noqa: BLE001
+                    names.append("?")
+            logger.warning(f"[kebiao] 找不到平台「{platform_name}」，现有：{names}")
+        except Exception:  # noqa: BLE001
+            logger.exception("[kebiao] 取平台实例失败")
+        return None
+
+    async def _member_title(self, client, gid: int, qq: str) -> str | None:
+        """读这个人的群头衔：None = 读失败，"" = 本来没有"""
+        try:
+            info = await client.get_group_member_info(
+                group_id=gid, user_id=int(qq), no_cache=True
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(info, dict):
+            return None
+        for key in ("special_title", "title"):
+            val = str(info.get(key) or "").strip()
+            if val:
+                return val
+        return ""
+
+    async def _set_title(self, client, gid: int, qq: str, text: str) -> bool:
+        try:
+            await client.set_group_special_title(
+                group_id=gid, user_id=int(qq), special_title=text
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[kebiao] 改头衔失败 {gid}/{qq}: {e}")
+            return False
+
+    async def _restore_titles(self) -> int:
+        """把所有改过的头衔还原（关功能时用）"""
+        st = title_state_load()
+        groups = st.get("groups") or {}
+        n = 0
+        keep = 0
+        for umo, applied in list(groups.items()):
+            client = self._client_for(str(umo).split(":")[0])
+            gid = _group_id_of(umo)
+            if not client or not gid:
+                continue
+            for qq, orig in list(applied.items()):
+                cur = await self._member_title(client, gid, qq)
+                if cur is not None and cur != TITLE_TEXT:
+                    applied.pop(qq, None)
+                    keep += 1
+                    continue
+                if await self._set_title(client, gid, qq, str(orig if orig is not None else "")):
+                    applied.pop(qq, None)
+                    n += 1
+                await asyncio.sleep(0.4)
+        st["groups"] = {k: v for k, v in groups.items() if v}
+        title_state_save(st)
+        self._restore_note = (n, keep)
+        return n
+
+    async def _tick_titles(self) -> None:
+        st = title_state_load()
+        if not st.get("enabled"):
+            return
+        groups = st.setdefault("groups", {})
+        now = datetime.now()
+        current: dict[str, set[str]] = {}
+        for u in in_class_users(now):
+            current.setdefault(u["umo"], set()).add(u["qq"])
+
+        clients: dict[str, object] = {}
+
+        def client_of(umo: str):
+            if umo not in clients:
+                clients[umo] = self._client_for(str(umo).split(":")[0])
+                if not clients[umo]:
+                    logger.warning(f"[kebiao] 头衔：没拿到平台客户端 {umo}")
+            return clients[umo]
+
+        changed = False
+
+        # 上课了 → 改头衔
+        for umo, qqs in current.items():
+            applied = groups.setdefault(umo, {})
+            for qq in qqs:
+                if qq in applied:
+                    continue
+                client = client_of(umo)
+                gid = _group_id_of(umo)
+                if not client or not gid:
+                    continue
+                orig = await self._member_title(client, gid, qq)
+                if await self._set_title(client, gid, qq, TITLE_TEXT):
+                    applied[qq] = orig
+                    changed = True
+                    logger.info(f"[kebiao] 头衔改为「{TITLE_TEXT}」 {gid}/{qq}")
+                await asyncio.sleep(0.5)
+
+        # 下课了 → 还原
+        for umo, applied in list(groups.items()):
+            still = current.get(umo, set())
+            for qq in list(applied):
+                if qq in still:
+                    continue
+                client = client_of(umo)
+                gid = _group_id_of(umo)
+                if not client or not gid:
+                    continue
+                cur = await self._member_title(client, gid, qq)
+                if cur is not None and cur != TITLE_TEXT:
+                    applied.pop(qq, None)
+                    changed = True
+                    logger.info(f"[kebiao] 头衔被改过，保留「{cur}」 {gid}/{qq}")
+                    continue
+                orig = applied.get(qq)
+                if await self._set_title(client, gid, qq, str(orig if orig is not None else "")):
+                    applied.pop(qq, None)
+                    changed = True
+                    logger.info(f"[kebiao] 头衔已还原 {gid}/{qq}")
+                await asyncio.sleep(0.5)
+
+        if changed:
+            st["groups"] = {k: v for k, v in groups.items() if v}
+            title_state_save(st)
+
+    @filter.command("头衔开")
+    async def title_on_cmd(self, event: AstrMessageEvent):
+        """上课时把群头衔改成「上课中」（管理员）"""
+        deny = self._need_admin(event)
+        if deny:
+            yield event.plain_result(deny)
+            return
+        st = title_state_load()
+        st["enabled"] = True
+        title_state_save(st)
+        yield event.plain_result(
+            f"🎩 上课头衔已开：上课时把群头衔改成「{TITLE_TEXT}」，下课自动还原\n"
+            "（要机器人是群主或管理员才行）\n"
+            "先发 /头衔测试 试一下能不能改"
+        )
+
+    @filter.command("头衔关")
+    async def title_off_cmd(self, event: AstrMessageEvent):
+        """关掉上课改头衔，并把改过的还原（管理员）"""
+        deny = self._need_admin(event)
+        if deny:
+            yield event.plain_result(deny)
+            return
+        st = title_state_load()
+        st["enabled"] = False
+        title_state_save(st)
+        n = await self._restore_titles()
+        keep = getattr(self, "_restore_note", (0, 0))[1]
+        msg = f"🔕 上课头衔已关，还原了 {n} 个人的头衔"
+        if keep:
+            msg += f"\n（{keep} 个人上课后又自己改过头衔，给你留着没动）"
+        yield event.plain_result(msg)
+
+    @filter.command("头衔测试")
+    async def title_test_cmd(self, event: AstrMessageEvent):
+        """给自己试改一次头衔，3 秒后还原（管理员）"""
+        deny = self._need_admin(event)
+        if deny:
+            yield event.plain_result(deny)
+            return
+        gid = int(str(event.get_group_id() or 0) or 0)
+        qq = str(event.get_sender_id() or "")
+        if not gid or not qq:
+            yield event.plain_result("这个要在群里用喵～")
+            return
+        client = self._client_for(str(event.get_platform_name() or ""))
+        if not client:
+            yield event.plain_result("没找到 QQ 平台的连接，可能是平台名对不上")
+            return
+        orig = await self._member_title(client, gid, qq)
+        ok = await self._set_title(client, gid, qq, TITLE_TEXT)
+        if not ok:
+            yield event.plain_result(
+                "改头衔失败了 😿 大概这几种原因：\n"
+                "· 机器人不是群主 / 管理员\n"
+                "· 当前 QQ 版本不支持改别人头衔\n"
+                "（日志里有具体报错）"
+            )
+            return
+        await asyncio.sleep(3)
+        back = await self._set_title(client, gid, qq, orig)
+        yield event.plain_result(
+            "改头衔成功 ✅ 刚才 3 秒里你的头衔是「" + TITLE_TEXT + "」\n"
+            + ("已经还原回去了" if back else f"还原失败，原头衔是「{orig or '空'}」")
+        )
+
+    @filter.command("头衔状态")
+    async def title_state_cmd(self, event: AstrMessageEvent):
+        """看上课头衔现在是开还是关"""
+        st = title_state_load()
+        groups = st.get("groups") or {}
+        n = sum(len(v) for v in groups.values())
+        yield event.plain_result(
+            f"🎩 上课头衔：{'开' if st.get('enabled') else '关'}\n"
+            f"现在被改着的：{n} 人\n"
+            "（/头衔开 打开 · /头衔关 关掉并还原 · /头衔测试 试一次）"
+        )
+
     # ---------- 开课播报开关 ----------
     @filter.command("播报开")
     async def who_push_on_cmd(self, event: AstrMessageEvent):
@@ -1353,6 +1637,7 @@ class KebiaoPlugin(Star):
                 await self._tick_reminders()
                 await self._tick_who()
                 await self._tick_leaderboard()
+                await self._tick_titles()
                 ticks += 1
                 if ticks % 40 == 1:  # 每 20 分钟留一行心跳，方便排查
                     logger.info(f"[kebiao] 提醒心跳 #{ticks} · {datetime.now():%H:%M:%S}")
